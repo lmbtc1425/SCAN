@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Escáner Gift Cards</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:system-ui,sans-serif;margin:0;padding:12px;background:#f2f3f5;color:#111;max-width:600px;margin-inline:auto}
+  h1{font-size:20px;margin:4px 0 10px}
+  .card{background:#fff;border-radius:12px;padding:12px;margin-bottom:12px;box-shadow:0 1px 3px #0002}
+  button,.btn{display:block;width:100%;padding:13px;border:0;border-radius:10px;font-size:16px;font-weight:600;background:#1a73e8;color:#fff;text-align:center;margin-top:8px}
+  button.sec,.btn.sec{background:#e8eaed;color:#111}
+  button.ok{background:#188038}
+  button.stop{background:#d93025}
+  button.del{background:#d93025;width:auto;padding:8px 12px;margin:0;font-size:14px}
+  .row{display:flex;gap:8px}.row>*{flex:1}
+  #cam{position:relative;background:#000;border-radius:10px;overflow:hidden;display:none}
+  video{width:100%;display:block;max-height:55vh;object-fit:cover}
+  #flash{position:absolute;inset:0;background:#2ecc71;opacity:0;pointer-events:none;transition:opacity .4s}
+  #guia{position:absolute;left:6%;right:6%;top:25%;bottom:25%;border:2px dashed #fff9;border-radius:10px;pointer-events:none}
+  #live{font-family:monospace;font-size:16px;margin-top:8px;padding:10px;background:#f6f8fa;border-radius:8px;min-height:44px;word-break:break-all}
+  #status{font-size:13px;color:#555;margin-top:6px;min-height:16px}
+  .item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 0;border-bottom:1px solid #eee;font-family:monospace;font-size:16px}
+  .item:last-child{border:0}
+  .item span{flex:1;word-break:break-all}
+  .item .edit{background:#e8eaed;color:#111;width:auto;padding:8px 12px;margin:0;font-size:14px}
+  textarea{width:100%;height:130px;font-family:monospace;font-size:15px;padding:10px;border-radius:8px;border:1px solid #ccc;margin-top:8px}
+  label.chk{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:14px}
+  input[type=checkbox]{width:20px;height:20px}
+  #fallback{display:none;margin-top:8px;font-size:13px;color:#b3261e}
+</style>
+</head>
+<body>
+<h1>📷 Escáner de Gift Cards</h1>
+
+<div class="card">
+  <div id="cam">
+    <video id="video" playsinline muted autoplay></video>
+    <div id="guia"></div>
+    <div id="flash"></div>
+  </div>
+  <div class="row">
+    <button id="btnCam">▶ Iniciar cámara</button>
+    <button id="btnCap" class="ok" style="display:none">Capturar ahora</button>
+  </div>
+  <label class="chk"><input type="checkbox" id="auto" checked> Agregar automáticamente al detectar</label>
+  <div id="live">—</div>
+  <div id="dbg" style="font-size:12px;color:#888;margin-top:4px;font-family:monospace;min-height:14px"></div>
+  <div id="status">Toca “Iniciar cámara” y apunta al código.</div>
+  <div id="fallback">
+    No se pudo abrir la cámara en vivo (el navegador la bloquea en archivos locales).
+    Usa el modo foto, o mira las instrucciones para abrir esta página por HTTPS.
+    <label class="btn sec" for="foto">Modo foto</label>
+    <input id="foto" type="file" accept="image/*" capture="environment" style="display:none">
+  </div>
+</div>
+
+<div class="card">
+  <b>Lista (<span id="n">0</span>)</b>
+  <div id="lista"></div>
+  <textarea id="salida" readonly placeholder="Aquí aparecerá el listado..."></textarea>
+  <button id="copiar">📋 Copiar todo</button>
+  <button class="sec" id="limpiar">Borrar lista</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const KEY = 'giftcards_lista_v1';
+let items = [];
+let worker = null, stream = null, running = false, busy = false;
+let lastKey = '', stable = 0, sinValor = 0;
+let lastCand = null; // última detección {codigo, valor}
+
+// ---------- Persistencia ----------
+function guardar(){ try { localStorage.setItem(KEY, JSON.stringify(items)); } catch(e){} }
+function cargar(){ try { items = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch(e){ items = []; } }
+
+// ---------- Parseo ----------
+function extraerCodigo(texto){
+  const limpio = texto.replace(/[|]/g, 'I');
+  let m = limpio.match(/c[oó0]digo\s*de\s*canje\s*[:;.]?\s*([A-Za-z0-9][A-Za-z0-9\- ]{9,24})/i);
+  if (m) {
+    const tok = m[1].trim().split(/\s+/)[0].replace(/-/g, '');
+    if (tok.length >= 10) return tok.toUpperCase();
+    const unido = m[1].replace(/[\s-]/g, '');
+    if (unido.length >= 10) return unido.slice(0, 14).toUpperCase();
+  }
+  m = limpio.match(/\b[A-Z0-9]{4}-[A-Z0-9]{6}-[A-Z0-9]{4}\b/i);
+  if (m) return m[0].replace(/-/g, '').toUpperCase();
+  const toks = limpio.match(/\b[A-Za-z0-9]{13,16}\b/g) || [];
+  for (const t of toks) if (/[A-Za-z]/.test(t) && /\d/.test(t)) return t.toUpperCase();
+  return '';
+}
+function extraerValor(texto){
+  const m = texto.match(/\$\s*([0-9][0-9.,\s]{0,8})/);
+  if (!m) return '';
+  let s = m[1].trim();
+  let sep = s.match(/^(\d{1,4})[.,](\d{1,2})\b/);
+  if (sep) return sep[1];
+  sep = s.match(/^(\d{1,4})\s+(\d{2})\b/);
+  if (sep) return sep[1];
+  const solo = s.match(/^\d+/)[0];
+  if (solo.length >= 4 && solo.endsWith('00')) return solo.slice(0,-2);
+  return solo;
+}
+
+// Valor por tamaño: toma solo los dígitos GRANDES (ignora $ y "00" en superíndice)
+function extraerValorGrande(data){
+  let syms = data.symbols;
+  if (!syms || !syms.length) {
+    syms = [];
+    (data.words || []).forEach(w => (w.symbols || []).forEach(s => syms.push(s)));
+  }
+  syms = syms.filter(s => s.bbox && s.text && s.text.trim());
+  if (!syms.length) {
+    const ws = (data.words || []).filter(w => w.bbox && /\d/.test(w.text));
+    if (!ws.length) return '';
+    const w = ws.reduce((a, b) => (b.bbox.y1 - b.bbox.y0) > (a.bbox.y1 - a.bbox.y0) ? b : a);
+    let t = w.text.replace(/[^0-9OoSsBIl|]/g, '').replace(/[Oo]/g, '0').replace(/[Ss]/g, '5').replace(/B/g, '8').replace(/[Il|]/g, '1');
+    if (t.length >= 4 && t.endsWith('00')) t = t.slice(0, -2);
+    return (t.length >= 1 && t.length <= 4) ? String(parseInt(t, 10)) : '';
+  }
+  const H = s => s.bbox.y1 - s.bbox.y0;
+  const cy = s => (s.bbox.y0 + s.bbox.y1) / 2;
+  const hs = syms.map(H).sort((a, b) => a - b);
+  const mediana = hs[Math.floor(hs.length / 2)];
+  const mapa = { O:'0', o:'0', Q:'0', D:'0', S:'5', s:'5', B:'8', I:'1', l:'1', '|':'1' };
+  const dig = s => { const c = s.text.trim()[0]; return /\d/.test(c) ? c : (mapa[c] || ''); };
+  const ds = syms.filter(s => dig(s) && (s.confidence === undefined || s.confidence > 40));
+  if (!ds.length) return '';
+  const tallest = ds.reduce((a, b) => H(b) > H(a) ? b : a);
+  const Hmax = H(tallest);
+  if (Hmax < 14 || Hmax < mediana * 1.25) return ''; // no hay un número claramente más grande que el resto
+  const grupo = ds
+    .filter(s => H(s) >= Hmax * 0.75 && Math.abs(cy(s) - cy(tallest)) < Hmax * 0.6)
+    .sort((a, b) => a.bbox.x0 - b.bbox.x0);
+  const i = grupo.indexOf(tallest);
+  let a = i, b = i;
+  while (a > 0 && grupo[a].bbox.x0 - grupo[a-1].bbox.x1 < Hmax * 1.2) a--;
+  while (b < grupo.length - 1 && grupo[b+1].bbox.x0 - grupo[b].bbox.x1 < Hmax * 1.2) b++;
+  const v = grupo.slice(a, b + 1).map(dig).join('');
+  return (v.length >= 1 && v.length <= 4) ? String(parseInt(v, 10)) : '';
+}
+
+// ---------- OCR ----------
+function preprocesar(source, w, h){
+  const maxW = 1400;
+  const scale = Math.min(1.5, maxW / w);
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+  const ctx = c.getContext('2d');
+  ctx.drawImage(source, 0, 0, c.width, c.height);
+  const d = ctx.getImageData(0, 0, c.width, c.height), p = d.data;
+  for (let i = 0; i < p.length; i += 4) {
+    let g = 0.299*p[i] + 0.587*p[i+1] + 0.114*p[i+2];
+    g = Math.max(0, Math.min(255, (g - 128) * 1.4 + 128));
+    p[i] = p[i+1] = p[i+2] = g;
+  }
+  ctx.putImageData(d, 0, 0);
+  return c;
+}
+async function getWorker(){
+  if (worker) return worker;
+  $('status').textContent = 'Cargando motor OCR (primera vez, requiere internet)...';
+  worker = await Tesseract.createWorker('eng');
+  return worker;
+}
+
+// ---------- Lector dedicado al valor (solo dígitos y $, texto disperso) ----------
+let worker2 = null;
+async function getWorkerValor(){
+  if (worker2) return worker2;
+  worker2 = await Tesseract.createWorker('eng');
+  await worker2.setParameters({ tessedit_char_whitelist: '0123456789$', tessedit_pageseg_mode: '11' });
+  return worker2;
+}
+async function leerValor(canvas){
+  try {
+    const w2 = await getWorkerValor();
+    const { data } = await w2.recognize(canvas);
+    return { v: extraerValorGrande(data), raw: (data.text || '').replace(/\s+/g, ' ').trim().slice(0, 40) };
+  } catch (e) { return { v: '', raw: '' }; }
+}
+
+// ---------- Lista ----------
+function render(){
+  $('n').textContent = items.length;
+  $('lista').innerHTML = '';
+  items.forEach((it, i) => {
+    const d = document.createElement('div'); d.className = 'item';
+    const s = document.createElement('span'); s.textContent = it.codigo + ' - ' + it.valor;
+    const e = document.createElement('button'); e.className = 'edit'; e.textContent = '✎';
+    e.onclick = () => {
+      const t = prompt('Editar (CÓDIGO - valor):', it.codigo + ' - ' + it.valor);
+      if (t === null) return;
+      const m = t.split(/\s+-\s+|\s+/);
+      const codigo = (m[0] || '').toUpperCase().replace(/[\s-]/g, '');
+      if (codigo) { items[i] = { codigo, valor: (m[1] || it.valor).replace(/^\$/, '') }; guardar(); render(); }
+    };
+    const b = document.createElement('button'); b.className = 'del'; b.textContent = '✕';
+    b.onclick = () => { items.splice(i, 1); guardar(); render(); };
+    d.append(s, e, b);
+    $('lista').appendChild(d);
+  });
+  $('salida').value = items.map(it => it.codigo + ' - ' + it.valor).join('\n');
+}
+function agregar(codigo, valor){
+  if (items.some(it => it.codigo === codigo)) { $('status').textContent = 'Ya estaba en la lista: ' + codigo; return false; }
+  items.push({ codigo, valor: valor || '?' });
+  guardar(); render();
+  $('flash').style.opacity = .6; setTimeout(() => $('flash').style.opacity = 0, 250);
+  if (navigator.vibrate) navigator.vibrate(120);
+  $('status').textContent = '✔ Agregado: ' + codigo + ' - ' + (valor || '?');
+  return true;
+}
+
+// ---------- Bucle de lectura en vivo ----------
+let votos = {}; // votos[codigo] = { n: lecturas, v: {valor: conteo}, tot: total de votos }
+async function ciclo(){
+  if (!running) return;
+  const v = $('video');
+  if (v.videoWidth && !busy) {
+    busy = true;
+    try {
+      const w = await getWorker();
+      const canvas = preprocesar(v, v.videoWidth, v.videoHeight);
+      const { data } = await w.recognize(canvas);
+      const texto = data.text || '';
+      const codigo = extraerCodigo(texto);
+      if (codigo) {
+        const r = await leerValor(canvas);
+        const valor = r.v || extraerValor(texto);
+        const o = votos[codigo] || (votos[codigo] = { n: 0, v: {}, tot: 0 });
+        o.n++;
+        if (valor) { o.v[valor] = (o.v[valor] || 0) + 1; o.tot++; }
+        let best = '', bn = 0;
+        for (const k in o.v) if (o.v[k] > bn) { best = k; bn = o.v[k]; }
+        lastCand = { codigo, valor: best };
+        $('live').textContent = codigo + ' - ' + (best || '?') + '  (lecturas: ' + o.n + ')';
+        $('dbg').textContent = 'lector de valor vio: "' + r.raw + '" → ' + (r.v || '—');
+        if ($('auto').checked) {
+          if ((bn >= 2 && bn * 2 > o.tot) || o.n >= 8) {
+            agregar(codigo, best);
+            votos = {};
+            await new Promise(res => setTimeout(res, 1500));
+          }
+        } else {
+          $('status').textContent = 'Detectado. Toca “Capturar ahora” para agregar.';
+        }
+      } else {
+        lastCand = null;
+        $('live').textContent = 'Buscando código...';
+        $('dbg').textContent = '';
+      }
+    } catch (err) { $('status').textContent = 'Error OCR: ' + err.message; }
+    busy = false;
+  }
+  setTimeout(ciclo, 200);
+}
+
+async function iniciar(){
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+    });
+    $('video').srcObject = stream;
+    $('cam').style.display = 'block';
+    $('btnCam').textContent = '■ Detener cámara'; $('btnCam').className = 'stop';
+    $('btnCap').style.display = 'block';
+    $('status').textContent = 'Leyendo... mantén el código quieto y bien enfocado.';
+    running = true; ciclo();
+  } catch (err) {
+    $('fallback').style.display = 'block';
+    $('status').textContent = 'Cámara no disponible: ' + (err.message || err.name);
+  }
+}
+function detener(){
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  $('cam').style.display = 'none';
+  $('btnCam').textContent = '▶ Iniciar cámara'; $('btnCam').className = '';
+  $('btnCap').style.display = 'none';
+  $('status').textContent = 'Cámara detenida.';
+}
+$('btnCam').onclick = () => running ? detener() : iniciar();
+$('btnCap').onclick = () => {
+  if (lastCand) agregar(lastCand.codigo, lastCand.valor);
+  else $('status').textContent = 'Aún no hay un código detectado.';
+};
+
+// Modo foto (respaldo)
+$('foto').addEventListener('change', async e => {
+  const file = e.target.files[0]; if (!file) return;
+  const img = new Image();
+  img.onload = async () => {
+    try {
+      const w = await getWorker();
+      $('status').textContent = 'Leyendo foto...';
+      const cv = preprocesar(img, img.width, img.height);
+      const { data } = await w.recognize(cv);
+      const codigo = extraerCodigo(data.text || '');
+      const rv = await leerValor(cv);
+      const valor = rv.v || extraerValor(data.text || '');
+      $('live').textContent = codigo ? codigo + ' - ' + (valor || '?') : 'No se detectó código';
+      if (codigo) {
+        const c = prompt('Confirma (CÓDIGO - valor):', codigo + ' - ' + (valor || ''));
+        if (c) { const m = c.split(/\s+-\s+|\s+/); agregar((m[0]||'').toUpperCase().replace(/[\s-]/g,''), (m[1]||'').replace(/^\$/, '')); }
+      }
+    } catch (err) { $('status').textContent = 'Error: ' + err.message; }
+  };
+  img.src = URL.createObjectURL(file);
+  e.target.value = '';
+});
+
+// ---------- Copiar / borrar ----------
+$('copiar').onclick = async () => {
+  const t = $('salida').value; if (!t) return;
+  try { await navigator.clipboard.writeText(t); }
+  catch { $('salida').select(); document.execCommand('copy'); }
+  $('copiar').textContent = '✔ Copiado';
+  setTimeout(() => $('copiar').textContent = '📋 Copiar todo', 1500);
+};
+$('limpiar').onclick = () => { if (confirm('¿Borrar toda la lista?')) { items = []; guardar(); render(); } };
+
+cargar(); render();
+</script>
+</body>
+</html>
